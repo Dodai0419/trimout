@@ -1,0 +1,31 @@
+diff --git a/a.py b/b.py
+similarity index 98%
+rename from a.py
+rename to b.py
+index 1..2 100644
+--- a/a.py
++++ b/b.py
+@@ -1,20 +1,20 @@
+ ctx 0
+ ctx 1
+ ctx 2
+ ctx 3
+ ctx 4
+ ctx 5
+ ctx 6
+ ctx 7
+ ctx 8
+-  - name: build
++--verbose
+-
++
+ ctx 9
+ ctx 10
+ ctx 11
+ ctx 12
+ ctx 13
+ ctx 14
+ ctx 15
+ ctx 16
+ ctx 17
+\ No newline at end of file

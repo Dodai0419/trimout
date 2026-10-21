@@ -1,0 +1,489 @@
+diff --git a/old/mcpcheck.py b/new/mcpcheck.py
+index 2be5460..fd949b8 100644
+--- a/old/mcpcheck.py
++++ b/new/mcpcheck.py
+@@ -1,11 +1,11 @@
+ #!/usr/bin/env python3
+ """mcpcheck: offline, read-only security audit of MCP client configs.
+ 
+ Runs two rule sets in one pass over the same files:
+-  MAT-001..012  config hygiene from mcp-audit-tool (graygnatconsole, MIT)
+-  st./en./zh.*  injection and structure rules from MCP-checkup (tiangang0245, MIT)
++  AGENT-029..057  MCP config rules from agent-audit (HeadyZhang, MIT)
++  st./en./zh.*    injection and structure rules from MCP-checkup (tiangang0245, MIT)
+ Never starts a server, never opens a socket, never prints env or header values.
+ 
+ Usage:
+   python mcpcheck.py [CONFIG...] [--project DIR] [--json] [--fail-on SEVERITY]
+ With no CONFIG, every known client config on this machine is checked.
+@@ -17,11 +17,10 @@ import re
+ import sys
+ import unicodedata
+ from urllib.parse import urlparse
+ 
+ SEVERITIES = ("critical", "high", "medium", "low", "info")
+-AUDIT_WEIGHT = {"critical": 40, "high": 20, "medium": 8, "low": 3, "info": 0}
+ RISK_WEIGHT = {"high": 10, "medium": 4, "low": 1, "info": 0}
+ 
+ # ---------------------------------------------------------------- discovery
+ HOME = os.path.expanduser("~")
+ APPDATA = os.environ.get("APPDATA") or os.path.join(HOME, "AppData", "Roaming")
+@@ -83,119 +82,242 @@ def load(path):
+     if not isinstance(doc, dict):
+         raise ValueError("top level is not an object")
+     return doc
+ 
+ 
+-def servers_for_mat(doc):
+-    """mcp-audit-tool's view: mcpServers, servers, or mcp.servers."""
+-    for sect in (doc.get("mcpServers"), doc.get("servers"),
+-                 doc["mcp"].get("servers") if isinstance(doc.get("mcp"), dict) else None):
+-        if isinstance(sect, dict):
+-            return {str(k): v for k, v in sect.items() if isinstance(v, dict)}
+-    return {}
+-
+ 
+ def servers_for_text(doc):
+     """MCP-checkup's view: the first of mcpServers, servers, context_servers, mcp."""
+     for key in ("mcpServers", "servers", "context_servers", "mcp"):
+         if isinstance(doc.get(key), dict):
+             return {str(k): v for k, v in doc[key].items() if isinstance(v, dict)}
+     return {}
+ 
+ 
+-# ---------------------------------------------------------------- MAT rules
+-SECRET_VALUES = re.compile("|".join([
+-    r"sk-[A-Za-z0-9_\-]{20,}", r"ghp_[A-Za-z0-9]{20,}", r"github_pat_[A-Za-z0-9_]{20,}", r"AKIA[0-9A-Z]{16}",
+-    r"xox[baprs]-[A-Za-z0-9\-]{10,}", r"-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----", r"AIza[0-9A-Za-z_\-]{35}"]))
+-SENSITIVE_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE)", re.I)
+-PLACEHOLDERS = ("your-", "xxx", "changeme", "example", "placeholder", "<", "todo")
+-RUNNERS = {"npx", "uvx", "pipx", "bunx", "pnpx", "yarn"}
+-PIPE_TO_SHELL = re.compile(r"(curl|wget)[^|]*\|\s*(sudo\s+)?(bash|sh|zsh|python\d*)", re.I)
+-DANGEROUS = [
+-    (re.compile(r"\brm\s+-[rf]{1,2}\b", re.I), "recursive/forced deletion (rm -rf)"),
+-    (re.compile(r"\bsudo\b"), "privilege escalation (sudo)"),
+-    (re.compile(r"\bchmod\s+777\b"), "world-writable permissions (chmod 777)"),
+-    (re.compile(r"\b(eval|exec)\b"), "dynamic code evaluation (eval/exec)"),
+-    (re.compile(r"\bmkfs\b|\bdd\s+if="), "disk-level operation"),
+-    (re.compile(r":\(\)\s*\{.*\};\s*:"), "fork bomb"),
+-]
+-SHELLS = {"sh", "bash", "zsh", "cmd", "cmd.exe", "powershell", "pwsh"}
+-BROAD_ROOTS = {"/", "~", "$HOME", "%USERPROFILE%", "C:\\", "/*"}
+-LOCAL = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+-POISONING = [re.compile(p, re.I) for p in (
+-    r"ignore (all |any )?(previous|prior|above) instructions", r"do not (mention|tell|reveal|disclose)",
+-    r"<(IMPORTANT|SYSTEM|HIDDEN|SECRET)>", r"you (must|should|are required to) (always|never)",
+-    r"exfiltrat|send (this|the|all) (data|file|content) to", r"read (the )?(file|contents of) ~/|\.ssh|id_rsa|\.env")]
+-RISKY_TOOL = re.compile(r"(write|delete|remove|exec|execute|run|shell|bash|terminal|send|post|upload|drop|rm)", re.I)
+-APPROVE_KEYS = ("alwaysAllow", "autoApprove", "auto_approve", "allowedTools")
+-
+-
+-def mat_rules(name, cfg):
+-    """Yield (rule, severity, location, title, fix) for one server entry."""
+-    args = [str(a) for a in (cfg.get("args") or [])]
+-    command = str(cfg.get("command", ""))
+-    env = cfg.get("env") or {}
+-    env = env if isinstance(env, dict) else {}
+-    for k, v in env.items():
+-        if isinstance(v, str) and (SECRET_VALUES.search(v) or (SENSITIVE_NAME.search(k) and len(v.strip()) >= 8
+-                                   and not any(h in v.strip().lower() for h in PLACEHOLDERS))):
+-            yield ("MAT-001", "critical", "env." + k, "Hardcoded secret in MCP server environment",
+-                   "Move the credential to a keychain or secrets manager and rotate it now.")
++# ---------------------------------------------------------------- AGENT rules
++def servers_for_agent(doc):
++    """agent-audit's view: mcpServers, else gateway.servers, else servers (list or dict)."""
++    if "mcpServers" in doc:
++        sect = doc["mcpServers"]
++        return [(n, c) for n, c in sect.items() if isinstance(c, dict)] if isinstance(sect, dict) else []
++    if isinstance(doc.get("gateway"), dict):
++        sect = doc["gateway"].get("servers", [])
++        return [(c.get("name", c.get("image", "unknown")), c) for c in sect if isinstance(c, dict)] \
++            if isinstance(sect, list) else []
++    sect = doc.get("servers")
++    if isinstance(sect, list):
++        return [(c.get("name", "unknown"), c) for c in sect if isinstance(c, dict)]
++    return [(n, c) for n, c in sect.items() if isinstance(c, dict)] if isinstance(sect, dict) else []
++
++
++def is_openapi(doc):
++    return isinstance(doc.get("openapi"), str) or isinstance(doc.get("swagger"), str) \
++        or ("paths" in doc and "mcpServers" not in doc)
++
++
++def transport(cfg):
++    t, url = cfg.get("transport"), cfg.get("url") or ""
++    if t:
++        return t
++    if not url:
++        return "stdio"
++    if "sse" in url.lower():
++        return "sse"
++    return "streamable-http" if url.startswith(("http://", "https://")) else None
++
++
++DANGEROUS_PATHS = ["/", "/home", "/etc", "/usr", "/var", "/root", "~", "$HOME", "%USERPROFILE%", "%HOMEPATH%",
++                   "C:\\", "C:/", "D:\\", "D:/"]
++SENSITIVE_ENV = re.compile(r"(key|secret|token|password|credential|auth|private)", re.I)
++SAFE_ENV = {"PATH", "NODE_ENV", "LOG_LEVEL", "DEBUG", "VERBOSE", "HOME", "USER", "SHELL", "TERM", "LANG", "LC_ALL",
++            "TZ", "PYTHONPATH", "NODE_PATH"}
++PLACEHOLDER = re.compile("|".join([
++    r"your[-_]?api[-_]?key[-_]?here", r"your[-_]\w+[-_]here\b", r"your[-_][\w-]*(?:token|key|secret|password)\b",
++    r"<[^>]{2,}>", r"^\$\{", r"xxx+", r"TODO", r"CHANGEME", r"insert[-_]?here", r"replace[-_]?me", r"example[-_]",
++    r"placeholder", r"dummy[-_]"]), re.I)
++SANDBOX = ("docker", "podman", "container", "sandbox", "nsjail", "firejail", "bubblewrap", "bwrap", "--read-only",
++           "seccomp", "apparmor")
++RISKY = ("python", "shell", "bash", "exec", "eval", "database", "sql", "code", "repl", "interpreter")
++AUTH_ENV = ("auth", "token", "api_key", "apikey", "authorization", "bearer", "secret", "credential", "password")
++OFFICIAL_SCOPE = "@modelcontextprotocol/"
++
++
++def agent_server_rules(name, cfg, grants):
++    """Yield (rule, severity, field, title) for one server, in agent-audit's order.
++
++    grants: the raw entry for the permission checks; agent-audit reads them only under mcpServers."""
++    args, env = cfg.get("args") or [], cfg.get("env") or {}
++    command, url, mode = cfg.get("command") or "", cfg.get("url") or "", transport(cfg)
++    # AGENT-029 overly broad filesystem access
++    for i, a in enumerate(args):
++        if not isinstance(a, str):
++            continue
++        if any(a == p or a.rstrip("/\\") == p.rstrip("/\\") for p in DANGEROUS_PATHS):
++            yield "AGENT-029", "high", "args[%d]" % i, "Filesystem access to '%s' is overly broad" % a
++        if "*" in a:
++            yield "AGENT-029", "high", "args[%d]" % i, "Wildcard path '%s' may grant unintended access" % a
++        if ".." in a:
++            yield "AGENT-029", "high", "args[%d]" % i, "Path traversal '%s' may escape the intended directory" % a
++    if "filesystem" in name.lower() or any("filesystem" in str(a).lower() for a in args):
++        if not [a for a in args if isinstance(a, str) and not a.startswith(("-", "@"))
++                and a not in ("npx", "uvx", "node", "python")]:
++            yield "AGENT-029", "medium", "args", "Filesystem server has no explicit path restriction"
++    # AGENT-030 unpinned or unencrypted server source
++    if command in ("npx", "node") or (args and args[0] == "npx"):
++        for i, a in enumerate(args):
++            if not isinstance(a, str) or a.startswith("-") or a == "npx":
++                continue
++            # same precedence as upstream: the length test picks which half of the condition applies
++            if a.startswith("@") or ((not a.startswith("/") and not a.startswith(".") and "/" not in a[:20])
++                                     if len(a) > 20 else "/" not in a):
++                if not re.search(r"@\d+\.\d+", a) and OFFICIAL_SCOPE not in a:
++                    yield "AGENT-030", "critical", "args[%d]" % i, "Unpinned package '%s' (rug-pull risk); pin @x.y.z" % a
++                break
++    if command == "uvx":
++        for i, a in enumerate(args):
++            if not isinstance(a, str) or a.startswith("-"):
++                continue
++            if not re.search(r"[=@]\d+\.\d+", a):
++                yield "AGENT-030", "critical", "args[%d]" % i, "Unpinned uvx package '%s'; pin a version" % a
++            break
++    if url.startswith("http://"):
++        yield "AGENT-030", "critical", "url", "Server URL uses unencrypted http://"
++    # AGENT-031 secrets in env (values are never echoed) and blanket grants
+     for k, v in env.items():
+-        if isinstance(v, str) and re.fullmatch(r"\$\{?[A-Z0-9_]+\}?", v.strip()) \
+-                and SENSITIVE_NAME.search(v.strip().strip("${}")):
+-            yield ("MAT-002", "high", "env." + k, "Sensitive host environment variable passed to MCP server",
+-                   "Give the server a narrowly scoped token instead of your primary credential.")
+-    cmd_name = command.split("/")[-1]
+-    pkg = next((a for a in args if not a.startswith("-")), None)
+-    if cmd_name in RUNNERS and pkg is not None and not (("@" in pkg[1:] and not pkg.endswith("@latest")) or "==" in pkg):
+-        yield ("MAT-003", "high", "args", "Unpinned MCP server package '%s' (rug-pull risk)" % pkg,
+-               "Pin an exact version, e.g. '%s@1.2.3', and review the source before upgrading." % pkg)
+-    if PIPE_TO_SHELL.search(command + " " + " ".join(args)):
+-        yield ("MAT-004", "critical", "command/args", "Pipe-to-shell installer in MCP server launch command",
+-               "Download, review and pin the script, or install through a versioned package manager.")
+-    launch = " ".join([command] + args)
+-    for rx, label in DANGEROUS:
+-        if rx.search(launch):
+-            yield ("MAT-005", "high", "command/args", "Dangerous command in MCP server launch: " + label,
+-                   "Drop privileged flags and sandbox the server.")
+-    if cmd_name.lower() in SHELLS and any(a in ("-c", "/c", "-Command") for a in args):
+-        yield ("MAT-006", "medium", "command/args", "Shell `-c` wrapper in MCP server launch",
+-               "Invoke the executable directly with an argument array.")
+-    if re.search(r"(filesystem|fs|files)", name, re.I) or re.search(r"(filesystem|fs|files)", " ".join(args), re.I):
+-        for a in args:
+-            if a.strip() in BROAD_ROOTS:
+-                yield ("MAT-007", "high", "args", "Filesystem MCP server granted root/home-wide access ('%s')" % a,
+-                       "Scope the server to a dedicated working directory.")
+-    url = next((cfg[k] for k in ("url", "serverUrl", "endpoint", "sse_url") if isinstance(cfg.get(k), str)), "")
+-    if url:
+-        u = urlparse(url)
+-        if u.scheme == "http" and u.hostname not in LOCAL:
+-            yield ("MAT-008", "high", "url", "Remote MCP server over plaintext HTTP", "Switch the endpoint to https://.")
+-        headers = cfg.get("headers") or {}
+-        authed = any(k.lower() in ("authorization", "x-api-key", "proxy-authorization") for k in headers) \
+-            or any("TOKEN" in k.upper() or "KEY" in k.upper() for k in env)
+-        if u.hostname not in LOCAL and not authed:
+-            yield ("MAT-009", "medium", "url", "Remote MCP server without authentication",
+-                   "Enable OAuth 2.1 or a bearer token and send it in headers.")
+-    text = "\n".join(cfg[k] for k in ("description", "instructions", "systemPrompt", "prompt")
+-                     if isinstance(cfg.get(k), str))
+-    hits = [m.group(0) for p in POISONING if text and (m := p.search(text))]
+-    if hits:
+-        yield ("MAT-010", "critical", "description", "Possible tool poisoning: " + ", ".join("'%s'" % h for h in hits[:5]),
+-               "Only run servers whose tool metadata you have audited; pin and hash tool definitions.")
+-    for k in APPROVE_KEYS:
+-        if isinstance(cfg.get(k), list):
+-            for tool in cfg[k]:
+-                if isinstance(tool, str) and RISKY_TOOL.search(tool):
+-                    yield ("MAT-011", "medium", k, "Risky tool '%s' auto-approved without confirmation" % tool,
+-                           "Require explicit confirmation for write/exec tools.")
+-    for k in APPROVE_KEYS + ("permissions", "scopes", "allow"):
+-        if isinstance(cfg.get(k), list) and any(str(v).strip() == "*" for v in cfg[k]):
+-            yield ("MAT-012", "medium", k, "Wildcard '*' permission in '%s'" % k,
+-                   "List exactly the tools you trust instead of '*'.")
+-
++        if not isinstance(v, str) or k.upper() in SAFE_ENV or not SENSITIVE_ENV.search(k):
++            continue
++        if v and not (v.startswith("$") or (v.startswith("%") and v.endswith("%"))):
++            if PLACEHOLDER.search(v):
++                yield "AGENT-031", "medium", "env." + k, "Placeholder value for sensitive key '%s'" % k
++            else:
++                yield "AGENT-031", "high", "env." + k, "Hardcoded value for sensitive key '%s'; use ${%s}" % (k, k)
++    sub = grants.get("config") if isinstance(grants.get("config"), dict) else {}
++    cmds = sub.get("allowedCommands", [])
++    if isinstance(cmds, list) and ("*" in cmds or "**" in cmds):
++        yield "AGENT-031", "critical", "config.allowedCommands", "Wildcard '*' command permission allows any command"
++    allow = grants.get("alwaysAllow", [])
++    if allow is True or (isinstance(allow, list) and "*" in allow):
++        yield "AGENT-031", "high", "alwaysAllow", "'alwaysAllow' grants every permission"
++    # AGENT-032 stdio without sandbox
++    if mode == "stdio":
++        cmd, joined = command.lower(), " ".join(str(a) for a in args).lower()
++        both = cmd + " " + joined
++        if not any(s in both for s in SANDBOX) and OFFICIAL_SCOPE not in joined and (
++                any(r in both for r in RISKY) or cmd in ("python", "python3")
++                or (cmd == "node" and any(k in both for k in ("shell", "exec", "eval", "code", "repl")))):
++            yield "AGENT-032", "medium", "command", "stdio server runs code without a sandbox; consider a container"
++    # AGENT-033 remote transport without auth
++    if mode in ("sse", "streamable-http") and not any(a in k.lower() for k in env for a in AUTH_ENV) \
++            and not ("@" in url and "://" in url):
++        yield "AGENT-033", "high", "headers", "Remote %s server has no auth configured" % mode
++
++
++POISON = {cat: [(re.compile(p), d) for p, d in pats] for cat, pats in {
++    "instruction_override": [
++        (r"(?i)ignore\s+(previous|all|above|prior)\s+(instructions?|rules?|constraints?)", "instruction override"),
++        (r"(?i)forget\s+(everything|all|previous)", "memory wipe directive"),
++        (r"(?i)you\s+(?:must|should|need\s+to)\s+(?:always|never)", "behavioral override"),
++        (r"(?i)override\s+(safety|security|policy|restrictions?)", "safety override"),
++        (r"(?i)disregard\s+(all|any|previous)", "disregard directive")],
++    "hidden_instruction": [
++        ("[\u200b-\u200f\u2028-\u202f\u2060-\u206f]", "zero-width/invisible characters"),
++        (r"<!--.*?-->", "HTML comment"), (r"\{%.*?%\}", "template injection"), (r"\$\{.*?\}", "variable interpolation")],
++    "command_injection": [
++        (r"(?i)(?:run|execute|eval|exec|system|shell)\s*\(", "function call in description"),
++        (r"`[^`]+`", "backtick execution"), (r"\$\([^)]+\)", "subshell execution"),
++        (r";\s*(?:rm|wget|curl|cat\s+/etc)", "command chaining")],
++    "data_exfiltration": [
++        (r"(?i)send\s+(?:all|the|user|private|secret)(?:\s+\w+)*\s+(?:data|info|keys?|tokens?)\s+to",
++         "data send directive"),
++        (r"(?i)(?:upload|post|transmit)\s+(?:to|at)\s+https?://", "upload to URL"),
++        (r"(?i)include\s+(?:api|secret|private)\s*key", "key inclusion directive")],
++    "privilege_escalation": [
++        (r"(?i)grant\s+(?:admin|root|full)\s+(?:access|permission|privilege)", "privilege grant"),
++        (r"(?i)(?:disable|bypass|skip)\s+(?:auth|authentication|authorization|verification)", "auth bypass"),
++        (r"(?i)(?:sudo|as\s+root|with\s+admin)", "elevated execution")],
++}.items()}
++
++
++def poison(text):
++    """First matching pattern per category, like agent-audit's ToolDescriptionAnalyzer."""
++    if not text or not text.strip():
++        return []
++    hits = (next(("%s pattern: %s" % (cat, d) for rx, d in pats if rx.search(text)), None) for cat, pats in POISON.items())
++    return [h for h in hits if h]
++
++
++def tool_lists(doc):
++    """(owner, tools) pairs: per-server tools, then top-level tools, then capabilities.tools."""
++    sect, caps = doc.get("mcpServers", {}), doc.get("capabilities", {})
++    out = [(n, c.get("tools", [])) for n, c in sect.items() if isinstance(c, dict)] if isinstance(sect, dict) else []
++    return out + [("_global_", doc.get("tools", [])),
++                  ("_capabilities_", caps.get("tools", []) if isinstance(caps, dict) else [])]
++
++
++def agent_file_rules(doc):
++    """Yield (rule, severity, server, field, title) for one file, in agent-audit's order."""
++    servers = servers_for_agent(doc)
++    if len(servers) > 10:
++        yield "AGENT-042", "medium", "_global_", "mcpServers", \
++            "%d servers configured (threshold 10): least privilege" % len(servers)
++    for name, cfg in servers:
++        for rule, sev, fld, title in agent_server_rules(str(name), cfg, cfg if "mcpServers" in doc else {}):
++            yield rule, sev, str(name), fld, title
++    lists = tool_lists(doc)
++    for owner, tools in lists[-2:] + lists[:-2]:  # the schema check visits top-level lists first
++        for t in tools if isinstance(tools, list) else []:
++            if not isinstance(t, dict):
++                continue
++            tn, schema = t.get("name", "unknown"), t.get("inputSchema") or {}
++            if schema.get("additionalProperties") is True:
++                yield "AGENT-040", "medium", tn, "inputSchema", "additionalProperties: true lets callers inject parameters"
++            props = schema.get("properties", {})
++            for p, d in (props.items() if isinstance(props, dict) else ()):
++                if isinstance(d, dict) and "type" not in d:
++                    yield "AGENT-040", "low", tn, "inputSchema.properties." + p, "Parameter '%s' has no type" % p
++            if not schema and t.get("description") and any(k in str(t["description"]).lower() for k in (
++                    "query", "search", "execute", "run", "write", "create", "update", "delete")):
++                yield "AGENT-040", "low", tn, "inputSchema", "Tool takes input but defines no inputSchema"
++    for owner, tools in lists:
++        for t in tools if isinstance(tools, list) else []:
++            if not isinstance(t, dict):
++                continue
++            tn = t.get("name", "unknown")
++            for hit in poison(tn) + poison(t.get("description", "")):
++                yield "AGENT-056", "high", owner, "tools." + str(tn), "Tool '%s' metadata has %s" % (tn, hit)
++            schema = t.get("inputSchema", {})
++            for p, d in (schema.get("properties", {}).items() if isinstance(schema, dict) else ()):
++                for hit in poison(d.get("description", "")) if isinstance(d, dict) else ():
++                    yield "AGENT-057", "high", owner, "tools.%s.%s" % (tn, p), "Argument '%s' of '%s' has %s" % (p, tn, hit)
++
++
++def shadowing(entries):
++    """AGENT-055 across all files: one tool name served by two servers, or two near-identical names."""
++    registry, owners = {}, set()
++    for e in entries:
++        if not e.get("agent"):
++            continue
++        sect, top = e["doc"].get("mcpServers", {}), e["doc"].get("tools")
++        pairs = [(n, c["tools"]) for n, c in sect.items() if isinstance(c, dict) and isinstance(c.get("tools"), list)
++                 and c["tools"]] if isinstance(sect, dict) else []
++        pairs += [("_config_" + e["path"], top)] if isinstance(top, list) and top else []
++        for owner, tools in pairs:
++            owners.add(owner)
++            for t in tools:
++                registry.setdefault(t.get("name", "").lower().strip(), {})[owner] = 1
++    if len(owners) < 2:
++        return
++    for tool, srv in registry.items():
++        if len(srv) > 1:
++            yield "AGENT-055", "high", next(iter(srv)), "tools." + tool, \
++                "Tool '%s' is registered by %s" % (tool, ", ".join(srv))
++    names = list(registry)
++    for i, a in enumerate(names):
++        for b in names[i + 1:]:
++            if len(a) > 5 and len(b) > 5 and set(registry[a]) != set(registry[b]) and distance(a, b) <= 2:
++                yield "AGENT-055", "medium", next(iter(registry[a])), "tools." + a, \
++                    "Tools '%s' and '%s' look alike across servers" % (a, b)
+ 
+ # ---------------------------------------------------------------- text rules
+ TEXT_RULES = [(i, s, re.compile(p, re.I), t) for i, s, p, t in [
+     ("en.override", "high", r"ignore\s+(?:all\s+|any\s+|the\s+)*(?:previous|prior|above|earlier)\s+(?:instructions?|prompts?|rules?|messages?)", "Instruction-override wording"),
+     ("en.hide_from_user", "high", r"do\s+not\s+(?:tell|inform|notify|reveal|disclose|mention)[^.\n]{0,40}user", "Ask to hide behaviour from the user"),
+@@ -293,72 +415,70 @@ def text_rules(name, cfg):
+     out.sort(key=lambda f: (SEV_RANK[f[1]], f[0]))
+     return out
+ 
+ 
+ # ---------------------------------------------------------------- report
+-TWINS = {"st.secret_in_config": "MAT-001", "st.plaintext_http": "MAT-008", "st.remote_no_auth": "MAT-009",
+-         "st.pipe_to_shell": "MAT-004", "st.root_path": "MAT-007", "st.home_dir": "MAT-007"}
++TWINS = {"st.secret_in_config": "AGENT-031", "st.plaintext_http": "AGENT-030", "st.remote_no_auth": "AGENT-033",
++         "st.root_path": "AGENT-029", "st.home_dir": "AGENT-029"}
+ 
+ 
+ def scan_file(client, path):
+     entry = {"client": client, "path": path, "servers": 0, "findings": []}
+     try:
+         doc = load(path)
+     except (OSError, ValueError) as e:
+         entry["error"] = str(e)
+         return entry
+-    mat, txt = servers_for_mat(doc), servers_for_text(doc)
+-    entry["servers"] = len(set(mat) | set(txt))
+-    for name in dict.fromkeys(list(mat) + list(txt)):
+-        found = [{"rule": r, "severity": s, "server": name, "field": loc, "title": t, "fix": fix}
+-                 for r, s, loc, t, fix in (mat_rules(name, mat[name]) if name in mat else ())]
+-        for r, s, fld, t, ex in (text_rules(name, txt[name]) if name in txt else ()):
+-            twin = next((f for f in found if f["rule"] == TWINS.get(r) and f["field"] in (fld, "args", "url")
+-                         and r not in f.get("also", [])), None)
+-            if twin and (r != "st.secret_in_config" or twin["field"] == fld):
++    # agent-audit reads only .json/.yaml files and skips OpenAPI specs
++    agent_ok = path.lower().endswith((".json", ".yaml", ".yml")) and not is_openapi(doc)
++    entry["doc"], entry["agent"] = doc, agent_ok
++    txt = servers_for_text(doc)
++    entry["servers"] = len({str(n) for n, _ in servers_for_agent(doc)} | set(txt))
++    found = [{"rule": r, "severity": s, "server": n, "field": fld, "title": t}
++             for r, s, n, fld, t in (agent_file_rules(doc) if agent_ok else ())]
++    for name, cfg in txt.items():
++        for r, s, fld, t, ex in text_rules(name, cfg):
++            twin = next((f for f in found if f["rule"] == TWINS.get(r) and f["server"] == name
++                         and f["field"] == fld and r not in f.get("also", [])), None)
++            if twin:
+                 twin.setdefault("also", []).append(r)
+                 continue
+             found.append({"rule": r, "severity": s, "server": name, "field": fld, "title": t, "excerpt": ex})
+-        entry["findings"] += found
++    entry["findings"] = found
+     return entry
+ 
+ 
+ def rule_ids(f):
+     return [f["rule"]] + f.get("also", [])
+ 
+ 
+-def summarize(files):
+-    findings = [f for e in files for f in e["findings"]]
+-    mat = [f for f in findings if f["rule"].startswith("MAT-")]
+-    score = max(0, 100 - sum(AUDIT_WEIGHT[f["severity"]] for f in mat))
+-    grade = next(g for t, g in ((95, "A+"), (90, "A"), (80, "B"), (70, "C"), (50, "D"), (0, "F")) if score >= t)
+-    risk = sum(RISK_WEIGHT[TEXT_SEV[r]] for f in findings for r in rule_ids(f) if not r.startswith("MAT-"))
+-    counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEVERITIES[:4]}
+-    return {"score": score, "grade": grade, "risk": risk, "counts": counts}
+-
+-
+ TEXT_SEV = {r[0]: r[1] for r in TEXT_RULES}
+ TEXT_SEV.update({"st.secret_in_config": "high", "st.remote_no_auth": "medium", "st.plaintext_http": "high",
+                  "st.typosquat": "high", "st.unknown_official_scope": "medium"})
+ 
+ 
++def summarize(files):
++    findings = [f for e in files for f in e["findings"]]
++    risk = sum(RISK_WEIGHT[TEXT_SEV[r]] for f in findings for r in rule_ids(f) if not r.startswith("AGENT-"))
++    counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEVERITIES[:4]}
++    return {"risk": risk, "counts": counts}
++
++
+ def print_text(files, summary):
+     print("mcpcheck - %d config files, %d servers (offline, read-only)" % (len(files), sum(e["servers"] for e in files)))
+     c = summary["counts"]
+-    print("score %d/100 (%s) - risk %d - %d critical, %d high, %d medium, %d low\n"
+-          % (summary["score"], summary["grade"], summary["risk"], c["critical"], c["high"], c["medium"], c["low"]))
++    print("risk %d - %d critical, %d high, %d medium, %d low\n"
++          % (summary["risk"], c["critical"], c["high"], c["medium"], c["low"]))
+     for e in files:
+         print("  %s  %s" % (e["client"], e["path"]))
+         if "error" in e:
+             print("    !! " + e["error"])
+         for f in sorted(e["findings"], key=lambda f: (f["server"], SEV_RANK[f["severity"]])):
+-            ids = " + ".join(rule_ids(f))
+-            print("    %-8s %-22s %-32s %s" % (f["severity"].upper(), f["server"][:22], ids, f["title"]))
++            print("    %-8s %-22s %-32s %s" % (f["severity"].upper(), f["server"][:22], " + ".join(rule_ids(f)),
++                                             f["title"]))
+             if f.get("excerpt"):
+                 print("             " + f["excerpt"])
+-            if f.get("fix"):
+-                print("             fix: " + f["fix"])
+         if not e["findings"] and "error" not in e:
+             print("    ok")
+         print()
+     print("env and header values are never printed - key names only.")
+ 
+@@ -377,10 +497,17 @@ def main(argv=None):
+     targets = discover(args.configs, args.project)
+     if not targets:
+         print("No MCP config found. Pass a file, or --project DIR.")
+         return 2
+     files = [scan_file(c, p) for c, p in targets]
++    first = next((e for e in files if e.get("agent")), None)
++    if first:  # like agent-audit, cross-file shadowing is reported on the first parsed file
++        first["findings"] += [{"rule": r, "severity": s, "server": n, "field": fld, "title": t}
++                              for r, s, n, fld, t in shadowing(files)]
++    for e in files:
++        e.pop("doc", None)
++        e.pop("agent", None)
+     summary = summarize(files)
+     if args.json:
+         print(json.dumps({"summary": summary, "files": files}, indent=2, ensure_ascii=False))
+     else:
+         print_text(files, summary)

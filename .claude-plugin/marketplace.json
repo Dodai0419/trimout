@@ -1,0 +1,1 @@
+{"name":"trimout","owner":{"name":"Dodai0419"},"plugins":[{"name":"trimout","source":"./","description":"Shrink tool output before your agent reads it: diffs, repeated log lines, minified blobs. One stdlib file."}]}

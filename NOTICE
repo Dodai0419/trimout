@@ -1,0 +1,15 @@
+trimout
+Copyright 2026 Dodai0419
+
+This product includes software ported from the following Apache-2.0 projects.
+The ports were rewritten in Python; behaviour is kept byte-identical.
+
+- caveman (https://github.com/JuliusBrussee/caveman)
+  Copyright 2026 Julius Brussee
+  Ported: engine/compressors/diff.go, engine/compressors/repetition.go,
+  engine/compressors/lineends.go
+
+- Headroom (https://github.com/headroomlabs-ai/headroom)
+  Copyright 2025 Headroom Contributors
+  Ported: headroom/transforms/dense_line_elider.py,
+  headroom/transforms/recursive_json.py (scan_json_documents and its helpers)

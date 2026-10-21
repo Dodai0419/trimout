@@ -1,0 +1,55 @@
+$ npm ci
+npm warn deprecated inflight@1.0.6: This module is not supported
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+downloading dependency... please wait
+added 812 packages in 14s
+
+
+
+> build
+> tsc -p .
+src/index.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.
+  retrying fetch (attempt 2)
+  retrying fetch (attempt 2)
+  retrying fetch (attempt 2)
+PASSED
+PASSED
+build failed
