@@ -1,0 +1,2 @@
+# keep test fixtures byte-exact (CRLF fixtures must stay CRLF)
+* -text
